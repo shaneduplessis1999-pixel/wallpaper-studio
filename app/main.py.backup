@@ -1,0 +1,671 @@
+
+#!/usr/bin/env python3
+
+import gi
+gi.require_version("Gtk", "4.0")
+from gi.repository import Gtk, Gdk, GLib
+
+import os
+import json
+import subprocess
+import socket
+import threading
+import queue
+from pathlib import Path
+
+
+# --------------------------------------------------
+# CONFIGURATION
+# --------------------------------------------------
+
+HOME = Path.home()
+
+WALLPAPER_DIR = HOME / "Pictures/Wallpapers"
+
+APP_DIR = HOME / ".local/share/wallpaper-studio"
+CACHE_DIR = APP_DIR / "cache"
+THUMB_DIR = CACHE_DIR / "thumbnails"
+PALETTE_DIR = CACHE_DIR / "palettes"
+
+MONITORS = [
+    "HDMI-A-3",
+    "DP-1",
+]
+
+RUNTIME_DIR = Path(
+    os.environ.get("XDG_RUNTIME_DIR", f"/run/user/{os.getuid()}")
+)
+
+SOCKET_PATH = RUNTIME_DIR / "wallpaper-studio.sock"
+
+SUPPORTED = {".jpg", ".jpeg", ".png", ".webp"}
+
+for directory in (THUMB_DIR, PALETTE_DIR):
+    directory.mkdir(parents=True, exist_ok=True)
+
+
+# --------------------------------------------------
+# COMMAND HELPERS
+# --------------------------------------------------
+
+def run_command(args, timeout=90):
+    try:
+        return subprocess.run(
+            args,
+            capture_output=True,
+            text=True,
+            timeout=timeout
+        )
+    except (OSError, subprocess.TimeoutExpired) as exc:
+        print(f"Command error: {exc}")
+        return None
+
+
+# --------------------------------------------------
+# WALLPAPER MANAGEMENT
+# --------------------------------------------------
+
+def set_wallpaper(path):
+    path = str(Path(path).expanduser().resolve())
+
+    success = True
+
+    for monitor in MONITORS:
+        result = run_command([
+            "hyprctl",
+            "hyprpaper",
+            "wallpaper",
+            f"{monitor}, {path}"
+        ])
+
+        if result is None or result.returncode != 0:
+            print(f"Failed to set wallpaper on {monitor}")
+            success = False
+
+    return success
+
+
+# --------------------------------------------------
+# MATUGEN
+# --------------------------------------------------
+
+def generate_theme(path):
+    result = run_command([
+        "matugen",
+        "image",
+        str(path),
+        "--prefer",
+        "saturation",
+        "-m",
+        "light"
+    ], timeout=120)
+
+    if result is None or result.returncode != 0:
+        print(
+            "Matugen failed:",
+            result.stderr if result else "No result"
+        )
+        return False
+
+    reload_result = run_command(["hyprctl", "reload"])
+
+    if reload_result is None or reload_result.returncode != 0:
+        print("Warning: Hyprland reload failed")
+
+    return True
+
+
+# --------------------------------------------------
+# BACKGROUND THEME WORKER
+# --------------------------------------------------
+
+class ThemeWorker:
+
+    def __init__(self):
+        self.jobs = queue.Queue(maxsize=1)
+        self.thread = threading.Thread(
+            target=self.work,
+            daemon=False
+        )
+        self.thread.start()
+
+    def submit(self, path):
+        try:
+            self.jobs.put_nowait(str(path))
+
+        except queue.Full:
+            try:
+                self.jobs.get_nowait()
+                self.jobs.task_done()
+            except queue.Empty:
+                pass
+
+            self.jobs.put_nowait(str(path))
+
+    def shutdown(self):
+        self.jobs.put(None)
+
+    def work(self):
+        while True:
+            path = self.jobs.get()
+
+            try:
+                if path is None:
+                    return
+
+                generate_theme(path)
+
+            finally:
+                self.jobs.task_done()
+
+
+# --------------------------------------------------
+# MAIN APPLICATION
+# --------------------------------------------------
+
+class WallpaperStudio(Gtk.Application):
+
+    def __init__(self):
+        super().__init__(
+            application_id="com.wallpaperstudio.App"
+        )
+
+        self.original = None
+        self.current = None
+        self.applied = False
+
+        self.hover_source = None
+
+        self.theme_worker = ThemeWorker()
+
+        self.ipc_socket = None
+        self.ipc_thread = None
+
+        self.closing = False
+
+    # --------------------------------------------------
+    # WINDOW
+    # --------------------------------------------------
+
+    def do_activate(self):
+
+        self.window = Gtk.ApplicationWindow(
+            application=self
+        )
+
+        self.window.set_title("Wallpaper Studio")
+        self.window.set_default_size(1000, 700)
+        self.window.set_resizable(False)
+        self.window.set_decorated(False)
+
+        self.window.connect(
+            "close-request",
+            self.on_close
+        )
+
+        self.add_styles()
+
+        root = Gtk.Box(
+            orientation=Gtk.Orientation.VERTICAL,
+            spacing=12
+        )
+
+        root.set_margin_top(20)
+        root.set_margin_bottom(20)
+        root.set_margin_start(24)
+        root.set_margin_end(24)
+
+        self.window.set_child(root)
+
+        # HEADER
+
+        header = Gtk.Box(spacing=12)
+
+        title = Gtk.Label(label="Wallpaper Studio")
+        title.add_css_class("title-1")
+        title.set_halign(Gtk.Align.START)
+
+        subtitle = Gtk.Label(
+            label="Live desktop wallpaper & theming"
+        )
+        subtitle.add_css_class("dim-label")
+
+        heading = Gtk.Box(
+            orientation=Gtk.Orientation.VERTICAL,
+            spacing=4
+        )
+
+        heading.append(title)
+        heading.append(subtitle)
+
+        header.append(heading)
+        root.append(header)
+
+        # STATUS
+
+        self.status = Gtk.Label(
+            label="Hover over a wallpaper to preview"
+        )
+
+        self.status.add_css_class("dim-label")
+        self.status.set_halign(Gtk.Align.START)
+
+        root.append(self.status)
+
+        # GALLERY
+
+        scroll = Gtk.ScrolledWindow()
+
+        scroll.set_vexpand(True)
+
+        scroll.set_policy(
+            Gtk.PolicyType.NEVER,
+            Gtk.PolicyType.AUTOMATIC
+        )
+
+        self.gallery = Gtk.FlowBox()
+
+        self.gallery.set_selection_mode(
+            Gtk.SelectionMode.NONE
+        )
+
+        self.gallery.set_homogeneous(True)
+        self.gallery.set_min_children_per_line(2)
+        self.gallery.set_max_children_per_line(3)
+        self.gallery.set_column_spacing(16)
+        self.gallery.set_row_spacing(16)
+
+        scroll.set_child(self.gallery)
+        root.append(scroll)
+
+        self.load_wallpapers()
+
+        # FOOTER
+
+        footer = Gtk.Box(
+            spacing=12,
+            halign=Gtk.Align.END
+        )
+
+        cancel = Gtk.Button(label="Cancel")
+        cancel.connect("clicked", self.on_cancel)
+
+        apply = Gtk.Button(label="Apply wallpaper")
+        apply.add_css_class("suggested-action")
+        apply.connect("clicked", self.on_apply)
+
+        footer.append(cancel)
+        footer.append(apply)
+
+        root.append(footer)
+
+        # IPC
+
+        self.start_ipc()
+
+        self.window.present()
+
+        # BACKGROUND PALETTE CACHE
+
+        threading.Thread(
+            target=self.cache_palettes,
+            daemon=True
+        ).start()
+
+    # --------------------------------------------------
+    # GTK STYLING
+    # --------------------------------------------------
+
+    def add_styles(self):
+
+        css = b"""
+        window {
+            background: #171b20;
+            color: #e5e9f0;
+        }
+
+        .wallpaper-card {
+            background: #252b33;
+            border-radius: 12px;
+            padding: 8px;
+            border: 2px solid #343c47;
+        }
+
+        .wallpaper-card:hover {
+            border-color: #82d3e1;
+            background: #303a44;
+        }
+
+        .title-1 {
+            font-size: 26px;
+            font-weight: bold;
+        }
+
+        button {
+            padding: 9px 18px;
+        }
+        """
+
+        provider = Gtk.CssProvider()
+        provider.load_from_data(css)
+
+        Gtk.StyleContext.add_provider_for_display(
+            Gdk.Display.get_default(),
+            provider,
+            Gtk.STYLE_PROVIDER_PRIORITY_APPLICATION
+        )
+
+    # --------------------------------------------------
+    # LOAD WALLPAPERS
+    # --------------------------------------------------
+
+    def load_wallpapers(self):
+
+        if not WALLPAPER_DIR.exists():
+            self.status.set_label(
+                f"Wallpaper folder not found: {WALLPAPER_DIR}"
+            )
+            return
+
+        files = sorted(
+            p for p in WALLPAPER_DIR.iterdir()
+            if p.is_file()
+            and p.suffix.lower() in SUPPORTED
+        )
+
+        if not files:
+            self.status.set_label(
+                f"No wallpapers found in {WALLPAPER_DIR}"
+            )
+            return
+
+        result = run_command([
+            "hyprctl",
+            "hyprpaper",
+            "listactive"
+        ])
+
+        if result and result.returncode == 0:
+
+            for line in result.stdout.splitlines():
+
+                if line.startswith("HDMI-A-3:"):
+
+                    self.original = line.split(
+                        ":", 1
+                    )[1].strip()
+
+                    self.current = self.original
+                    break
+
+        for path in files:
+            self.add_wallpaper(path)
+
+    # --------------------------------------------------
+    # WALLPAPER CARDS
+    # --------------------------------------------------
+
+    def add_wallpaper(self, path):
+
+        card = Gtk.Box(
+            orientation=Gtk.Orientation.VERTICAL,
+            spacing=8
+        )
+
+        card.add_css_class("wallpaper-card")
+
+        thumb = THUMB_DIR / f"{path.stem}.jpg"
+
+        if (
+            not thumb.exists()
+            or thumb.stat().st_mtime < path.stat().st_mtime
+        ):
+
+            run_command([
+                "/usr/sbin/magick",
+                str(path),
+                "-thumbnail",
+                "320x180^",
+                "-gravity",
+                "center",
+                "-extent",
+                "320x180",
+                str(thumb)
+            ], timeout=30)
+
+        image_path = thumb if thumb.exists() else path
+
+        picture = Gtk.Picture.new_for_filename(
+            str(image_path)
+        )
+
+        picture.set_size_request(320, 180)
+        picture.set_content_fit(Gtk.ContentFit.COVER)
+        picture.set_can_shrink(True)
+
+        label = Gtk.Label(label=path.name)
+        label.set_ellipsize(3)
+
+        card.append(picture)
+        card.append(label)
+
+        motion = Gtk.EventControllerMotion()
+
+        motion.connect(
+            "enter",
+            lambda *_args, p=path: self.on_hover(p)
+        )
+
+        card.add_controller(motion)
+
+        child = Gtk.FlowBoxChild()
+        child.set_child(card)
+
+        self.gallery.append(child)
+
+    # --------------------------------------------------
+    # LIVE PREVIEW
+    # --------------------------------------------------
+
+    def on_hover(self, path):
+
+        self.current = str(path)
+
+        self.status.set_label(
+            f"Previewing: {path.name}"
+        )
+
+        if set_wallpaper(path):
+
+            self.status.set_label(
+                f"Previewing: {path.name} — updating theme..."
+            )
+
+        if self.hover_source is not None:
+            GLib.source_remove(self.hover_source)
+
+        self.hover_source = GLib.timeout_add(
+            350,
+            self.start_theme_preview,
+            str(path)
+        )
+
+    def start_theme_preview(self, path):
+
+        self.hover_source = None
+
+        self.theme_worker.submit(path)
+
+        return GLib.SOURCE_REMOVE
+
+    # --------------------------------------------------
+    # PALETTE CACHE
+    # --------------------------------------------------
+
+    def cache_palettes(self):
+
+        files = sorted(
+            p for p in WALLPAPER_DIR.iterdir()
+            if p.is_file()
+            and p.suffix.lower() in SUPPORTED
+        )
+
+        for path in files:
+
+            cache = PALETTE_DIR / f"{path.stem}.json"
+
+            if (
+                cache.exists()
+                and cache.stat().st_mtime >= path.stat().st_mtime
+            ):
+                continue
+
+            result = run_command([
+                "matugen",
+                "image",
+                str(path),
+                "--prefer",
+                "saturation",
+                "-m",
+                "light",
+                "--dry-run",
+                "--json",
+                "hex",
+                "--include-image-in-json",
+                "false"
+            ], timeout=120)
+
+            if result and result.returncode == 0:
+
+                try:
+                    data = json.loads(result.stdout)
+
+                    cache.write_text(
+                        json.dumps(data, indent=2)
+                    )
+
+                except (json.JSONDecodeError, OSError) as exc:
+                    print("Palette cache error:", exc)
+
+    # --------------------------------------------------
+    # APPLY WALLPAPER
+    # --------------------------------------------------
+
+    def on_apply(self, *_args):
+
+        if not self.current:
+            return
+
+        self.applied = True
+
+        path = self.current
+
+        set_wallpaper(path)
+
+        self.theme_worker.submit(path)
+
+        self.theme_worker.shutdown()
+
+        self.window.close()
+
+    # --------------------------------------------------
+    # CANCEL
+    # --------------------------------------------------
+
+    def on_cancel(self, *_args):
+        self.window.close()
+
+    # --------------------------------------------------
+    # IPC SERVER
+    # --------------------------------------------------
+
+    def start_ipc(self):
+
+        try:
+
+            SOCKET_PATH.unlink(missing_ok=True)
+
+            self.ipc_socket = socket.socket(
+                socket.AF_UNIX,
+                socket.SOCK_STREAM
+            )
+
+            self.ipc_socket.bind(str(SOCKET_PATH))
+            self.ipc_socket.listen(2)
+            self.ipc_socket.settimeout(0.5)
+
+            self.ipc_thread = threading.Thread(
+                target=self.ipc_loop,
+                daemon=True
+            )
+
+            self.ipc_thread.start()
+
+        except OSError as exc:
+            print(f"IPC startup error: {exc}")
+
+    def ipc_loop(self):
+
+        while self.ipc_socket:
+
+            try:
+                conn, _ = self.ipc_socket.accept()
+
+            except socket.timeout:
+                continue
+
+            except OSError:
+                break
+
+            with conn:
+
+                command = conn.recv(32).decode().strip()
+
+                if command == "CLOSE":
+                    GLib.idle_add(self.window.close)
+
+    def stop_ipc(self):
+
+        if self.ipc_socket:
+
+            self.ipc_socket.close()
+            self.ipc_socket = None
+
+        SOCKET_PATH.unlink(missing_ok=True)
+
+    # --------------------------------------------------
+    # CLEANUP
+    # --------------------------------------------------
+
+    def on_close(self, *_args):
+
+        if self.closing:
+            return False
+
+        self.closing = True
+
+        if self.hover_source is not None:
+            GLib.source_remove(self.hover_source)
+            self.hover_source = None
+
+        self.stop_ipc()
+
+        if not self.applied and self.original:
+
+            set_wallpaper(self.original)
+
+            self.theme_worker.submit(self.original)
+
+        self.theme_worker.shutdown()
+
+        return False
+
+
+# --------------------------------------------------
+# APPLICATION ENTRY POINT
+# --------------------------------------------------
+
+if __name__ == "__main__":
+
+    app = WallpaperStudio()
+    app.run()
